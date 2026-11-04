@@ -1,7 +1,8 @@
 # extractor.py
 """
 Módulo encargado de la extracción y parseo de datos desde plataformas Tabbycat.
-Contiene la lógica de peticiones HTTP, BeautifulSoup y extracción de objetos JSON (vueData).
+Contiene la lógica de peticiones HTTP, BeautifulSoup, extracción de objetos JSON (vueData),
+resolución de portales de bienvenida y lectura detallada de papeletas (ballots).
 """
 import re
 from urllib.parse import urljoin, urlparse
@@ -12,24 +13,70 @@ import requests
 from bs4 import BeautifulSoup
 
 
+def resolver_url_base_torneo(base_url, log_func=print):
+    """
+    Verifica si la URL es un portal de bienvenida de Tabbycat (con múltiples categorías).
+    Prioriza estrictamente la categoría 'Open' o la principal antes que masters o alternas.
+    """
+    try:
+        response = requests.get(base_url, timeout=15)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'lxml')
+        
+        links = soup.find_all('a', href=True)
+        candidato_url = None
+        candidato_open = None
+        
+        for link in links:
+            href = link['href']
+            text = link.get_text(strip=True).lower()
+            full_url = urljoin(base_url, href)
+            
+            # Omitir enlaces administrativos o de login
+            if 'login' in full_url or 'admin' in full_url:
+                continue
+                
+            # PRIORIDAD MÁXIMA: Si el link o texto contiene explícitamente 'open'
+            if 'open' in full_url.lower() or 'open' in text:
+                candidato_open = full_url
+                break # Encontró el open exacto, salimos de inmediato
+                
+            # Si no hay 'open' directo, guardamos una opción general o de campeonato
+            if any(k in text for k in ['campeonato', 'mundial', 'general']) and not candidato_url:
+                candidato_url = full_url
+                        
+        # Seleccionar primero el open si existe, de lo contrario el candidato general, o la URL original
+        url_elegida = candidato_open or candidato_url
+        
+        if url_elegida and url_elegida != base_url:
+            log_func(f"  [i] Portal de bienvenida detectado. Redirigindo a la categoría principal (Open): {url_elegida}")
+            return url_elegida
+            
+        return base_url
+    except Exception as e:
+        log_func(f"  [!] No se pudo resolver la URL base, usando la original: {e}")
+        return base_url
+
 def find_data_links(base_url, log_func=print):
-    """Busca enlaces relevantes de oradores, equipos, rondas y mociones en la página principal del torneo."""
-    log_func(f"Buscando enlaces de datos en: {base_url}")
+    """Busca enlaces relevantes de oradores, equipos, rondas y mociones en la página del torneo."""
+    base_url_efectiva = resolver_url_base_torneo(base_url, log_func)
+    
+    log_func(f"Buscando enlaces de datos en: {base_url_efectiva}")
     PALABRAS_CLAVE = [
         'speaker', 'team', 'result', 'draw', 'standings', 'tab', 
-        'break', 'adjudicator', 'juez', 'motion', 'mocion'
+        'break', 'adjudicator', 'juez', 'motion', 'mocion', 'ballot'
     ]
     found_tab_links = {}
     try:
-        response = requests.get(base_url, timeout=15)
+        response = requests.get(base_url_efectiva, timeout=15)
         response.raise_for_status() 
         soup = BeautifulSoup(response.text, 'lxml')
         all_links = soup.find_all('a', href=True)
         for link in all_links:
             href = link['href']
             if any(keyword in href.lower() for keyword in PALABRAS_CLAVE):
-                full_url = urljoin(base_url, href)
-                if urlparse(full_url).netloc == urlparse(base_url).netloc:
+                full_url = urljoin(base_url_efectiva, href)
+                if urlparse(full_url).netloc == urlparse(base_url_efectiva).netloc:
                     link_text = link.get_text(strip=True) or "Enlace Genérico"
                     found_tab_links[full_url] = link_text
         log_func(f"  └> Se encontraron {len(found_tab_links)} enlaces relevantes.")
@@ -116,8 +163,82 @@ def get_elim_round_name(advancing_count, json_title="", page_title="", page_subt
     return None
 
 
+def extract_ballot_speakers_from_url(url, log_func=print):
+    """
+    Extrae los puntajes, nombres y roles exactos de los oradores directamente desde 
+    la vista de la papeleta (ballot) de Tabbycat, mapeando el orden estricto de BP.
+    """
+    try:
+        response = requests.get(url, timeout=15)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'lxml')
+        
+        scoresheet_divs = soup.find_all('div', class_='list-group')
+        if not scoresheet_divs:
+            return []
+
+        ballot_records = []
+        banco_mapping = [
+            ("Opening Government", "PM", "DPM"),
+            ("Opening Opposition", "LO", "DLO"),
+            ("Closing Government", "MG", "GW"),
+            ("Closing Opposition", "MO", "OW")
+        ]
+
+        for idx, list_group in enumerate(scoresheet_divs[:4]):
+            side_name, role_1, role_2 = banco_mapping[idx]
+            items = list_group.find_all('li', class_='list-group-item')
+            
+            speakers_in_team = []
+            team_name = ""
+            
+            for item in items:
+                text_content = item.get_text()
+                strong_tag = item.find('strong')
+                badge_tag = item.find('span', class_='badge')
+                
+                if strong_tag and badge_tag:
+                    d_role = strong_tag.get_text(strip=True)
+                    full_text = item.get_text(" ", strip=True)
+                    speaker_name = full_text.replace(d_role, "").replace(badge_tag.get_text(), "").strip()
+                    try:
+                        score = float(badge_tag.get_text(strip=True))
+                    except ValueError:
+                        score = np.nan
+                    speakers_in_team.append((speaker_name, d_role, score))
+                elif "Total for" in text_content:
+                    match_team = re.search(r'Total for\s+(.*?)\s+\(', text_content)
+                    if match_team:
+                        team_name = match_team.group(1).strip()
+
+            if len(speakers_in_team) >= 2 and team_name:
+                s1_name, s1_role, s1_score = speakers_in_team[0]
+                ballot_records.append({
+                    'team': team_name,
+                    'Side': side_name,
+                    'name': s1_name,
+                    'Total': s1_score,
+                    'd_role': s1_role,
+                    't_role': 'first'
+                })
+                s2_name, s2_role, s2_score = speakers_in_team[1]
+                ballot_records.append({
+                    'team': team_name,
+                    'Side': side_name,
+                    'name': s2_name,
+                    'Total': s2_score,
+                    'd_role': s2_role,
+                    't_role': 'second'
+                })
+
+        return ballot_records
+    except Exception as e:
+        log_func(f"  [!] Error extrayendo ballot de {url}: {e}")
+        return []
+
+
 def extract_tables_from_url(url, link_text="", log_func=print):
-    """Extrae las tablas incrustadas en el objeto JavaScript (window.vueData) de Tabbycat."""
+    """Extrae las tablas incrustadas en el objeto JavaScript (window.vueData) de Tabbycat limpiando objetos JSON."""
     try:
         response = requests.get(url, timeout=15)
         response.raise_for_status() 
@@ -185,7 +306,12 @@ def extract_tables_from_url(url, link_text="", log_func=print):
             for row_data_list in table_data.get('data', []):
                 row_values = []
                 for cell_data in row_data_list:
-                    value_to_clean = cell_data.get('text') if isinstance(cell_data, dict) else cell_data
+                    # EXTRAER SOLAMENTE EL TEXTO SI VIENE COMO DICCIONARIO COMPLEX DE VUE/TABBYCAT
+                    if isinstance(cell_data, dict):
+                        value_to_clean = cell_data.get('text', str(cell_data))
+                    else:
+                        value_to_clean = cell_data
+
                     if isinstance(value_to_clean, str) and '<' in value_to_clean:
                         row_values.append(BeautifulSoup(value_to_clean, 'lxml').get_text())
                     else:
@@ -193,15 +319,19 @@ def extract_tables_from_url(url, link_text="", log_func=print):
                 rows_list.append(row_values)
                 
             df = pd.DataFrame(rows_list, columns=headers)
-            df = df.replace('—', np.nan) 
-            for col in df.columns: df[col] = pd.to_numeric(df[col], errors='ignore')
+            
+            # Sanitización global extra para cualquier columna que aún sea dict
+            for col in df.columns:
+                df[col] = df[col].apply(lambda x: x.get('text') if isinstance(x, dict) and 'text' in x else x)
+                df[col] = df[col].replace('—', np.nan) 
+                df[col] = pd.to_numeric(df[col], errors='ignore')
+                
             extracted_tables.append((final_table_title, df))
             
         return extracted_tables
     except Exception as e:
         log_func(f"  [!] Error extrayendo tabla de {url}: {e}")
         return []
-
 
 def create_team_round_key(df, team_col, round_col, tourney_col):
     """Crea una llave única combinando equipo, ronda y torneo para control de datos."""
