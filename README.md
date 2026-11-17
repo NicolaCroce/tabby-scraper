@@ -9,13 +9,13 @@
 ### Overview
 A robust, production-grade data pipeline for the automated extraction, parsing, and ingestion of British Parliamentary (BP) debate tournament data from Tabbycat platforms into a PostgreSQL database hosted on Neon DB.
 
-The project features a decoupled Python architecture, automated duplicate prevention using a two-step failsafe, smart welcome portal resolution, extraction of exact BP speaker/team roles (`d_role`, `t_role`), and partial update capabilities for complete future-proofing.
+The project features a **decoupled in-memory Python architecture**, automated duplicate prevention via URL failsafes, smart welcome portal resolution, exact BP speaker/team role extraction (`d_role`, `t_role`), and an **intelligent Team Record fallback engine** for tournaments with private or unreleased ballots.
 
 ---
 
 ### Project Architecture
 
-The repository utilizes a flat modular design structured by separation of concerns:
+The repository utilizes a modular design structured by separation of concerns:
 
 ```text
 tabbycat-neon-scraper/
@@ -26,8 +26,8 @@ tabbycat-neon-scraper/
 ├── .gitignore            # Git exclusion rules
 │
 ├── config.py             # Configuration management using python-dotenv
-├── extractor.py          # Web scraping, vueData parsing, ballot extraction & portal resolution
-├── loader.py             # Database operations, 2-step failsafe, partial updates & clean ingestion
+├── extractor.py          # Web scraping, vueData parsing, ballot extraction & Team Record fallback
+├── loader.py             # Decoupled in-memory processing, URL failsafe & fast Neon DB ingestion
 ├── ui.py                 # Tkinter GUI, manual/batch queuing, and background execution logs
 │
 └── main.py               # Application orchestrator and main entry point
@@ -40,15 +40,14 @@ tabbycat-neon-scraper/
 1. **Smart Portal Navigation (`extractor.py`)**
    * Automatically resolves multi-category Tabbycat "Welcome Portals" (e.g., CMUDE) by identifying and navigating directly to the primary category (prioritizing `Open` tracks).
 
-2. **Advanced Ballot Parsing & Role Extraction (`extractor.py`)**
-   * Decodes embedded JavaScript state objects (`window.vueData`) and raw ballot sheets.
-   * Flattens complex Vue JSON dictionary payloads (popovers, icons, tooltips) into clean database-ready text.
-   * Captures speaker roles (`d_role`: PM, DPM, LO, DLO, etc.) and speaker positions (`t_role`: first, second).
+2. **Dual-Engine Ballot & Role Extraction (`extractor.py`)**
+   * **Primary Engine (Public Ballots):** Decodes embedded JavaScript state objects (`window.vueData`) and public scoresheets to capture exact speaker roles (`d_role`: PM, DPM, LO, DLO, MG, GW, MO, OW) and speaking order (`t_role`).
+   * **Team Record Fallback Engine:** When a tournament does not release public ballots (e.g., PUCP Open, Rosario Open), the extractor automatically parses the `Team Record` HTML/JSON tooltips and chamber placements to deterministically reconstruct speaker roles and scores in exact speaking order.
 
-3. **Two-Step Failsafe & Idempotent Ingestion (`loader.py`)**
-   * **Step 1 (URL Existence Check):** Prevents re-ingesting already fully loaded tournaments based on domain registration in `master_torneos_registro`.
-   * **Step 2 (Future-Proofing / Partial Updates):** Inspects loaded datasets for entirely `NULL` target columns (e.g., missing `d_role` or `t_role`) and triggers targeted column updates without duplicating rows.
-   * **Clean Ingestion:** Performs per-tournament pre-insertion `DELETE` statements on tables (`master_speakers_ajustado`, `master_consolidado_resultados`, `master_breaking_adjudicators`) to guarantee strict idempotency.
+3. **Decoupled In-Memory Processing & Failsafe Ingestion (`loader.py`)**
+   * **URL Failsafe Check:** Verifies domain registration in `master_torneos_registro` before scraping to prevent redundant runs and duplicate data.
+   * **Zero-Idle-Connection Scraping:** Executes all HTTP requests, Pandas transformations, and role merges purely in local memory first, opening the Neon PostgreSQL connection strictly for fast batch `INSERT` operations (`chunksize=500`).
+   * **Numeric Adjudicator Mapping:** Extracts breaking adjudicator rosters alongside binary numeric flags (`1.0` / `0.0`) for `adjcore` and `independent` statuses.
 
 4. **Desktop Interface (`ui.py`)**
    * Supports manual text entry, bulk queuing via CSV/Excel, real-time thread logging, and asynchronous background processing.
@@ -57,11 +56,11 @@ tabbycat-neon-scraper/
 
 ### Database Schema (Neon PostgreSQL)
 
-* **`master_torneos_registro`**: Control table tracking processed tournament URLs and statuses.
-* **`master_motions`**: Tournament motions and infoslides (`ON CONFLICT (motion) DO NOTHING`).
-* **`master_speakers_ajustado`**: Speaker speaker tab entries, including scores, round keys, `d_role`, and `t_role`.
-* **`master_consolidado_resultados`**: Round results, side placements, and team keys.
-* **`master_breaking_adjudicators`**: Breaking adjudicator rosters and scores.
+* **`master_torneos_registro`**: Control table tracking processed tournament URLs, slugs, dates, and statuses.
+* **`master_motions`**: Tournament motions and infoslides extracted per round.
+* **`master_speakers_ajustado`**: Speaker tab entries melted by round, including individual scores, `d_role`, and tournament metadata.
+* **`master_consolidado_resultados`**: Round results, chamber placements (`Side`), and team records.
+* **`master_breaking_adjudicators`**: Breaking adjudicator rosters, institutions, and numeric status flags (`adjcore`, `independent`).
 
 ---
 
@@ -109,7 +108,7 @@ python main.py
 ### Descripción General
 Un pipeline de datos robusto y listo para producción diseñado para la extracción, limpieza e ingesta automatizada de torneos de debate bajo el formato Parlamento Británico (BP) desde plataformas Tabbycat hacia PostgreSQL en Neon DB.
 
-El proyecto implementa una arquitectura desacoplada en Python, un sistema Failsafe de dos pasos para la prevención de duplicados, resolución inteligente de portales de bienvenida, extracción detallada de roles (`d_role`, `t_role`) y actualizaciones parciales para garantizar *future-proofing*.
+El proyecto implementa una **arquitectura desacoplada en memoria** en Python, prevención de duplicados mediante verificación de dominio, resolución inteligente de portales de bienvenida, extracción detallada de roles (`d_role`) y un **motor de respaldo (*fallback*) basado en Team Records** para torneos que no liberan papeletas públicas.
 
 ---
 
@@ -126,8 +125,8 @@ tabbycat-neon-scraper/
 ├── .gitignore            # Reglas de exclusión de Git
 │
 ├── config.py             # Gestión de configuración mediante python-dotenv
-├── extractor.py          # Scraping, parsing de vueData, lectura de papeletas y resolución de portales
-├── loader.py             # Operaciones SQL, Failsafe de 2 pasos, actualizaciones parciales e ingesta limpia
+├── extractor.py          # Scraping, parsing de vueData, lectura de papeletas y fallback de Team Record
+├── loader.py             # Procesamiento desacoplado en memoria, Failsafe por URL e ingesta rápida en Neon
 ├── ui.py                 # Interfaz gráfica Tkinter, cola de torneos y logs en tiempo real
 │
 └── main.py               # Orquestador principal y punto de entrada
@@ -140,15 +139,14 @@ tabbycat-neon-scraper/
 1. **Resolución Inteligente de Portales (`extractor.py`)**
    * Detecta automáticamente si una URL corresponde a un portal de bienvenida con múltiples categorías (ej. CMUDE) y redirige la extracción hacia la categoría principal (dando prioridad estricta a la categoría `Open`).
 
-2. **Parsing de Papeletas y Extracción de Roles (`extractor.py`)**
-   * Decodifica las variables de estado JavaScript (`window.vueData`) y papeletas detalladas.
-   * Aplana diccionarios y objetos complejos de Vue (popovers, emojis, HTML) a cadenas de texto limpias compatibles con PostgreSQL.
-   * Extrae los roles individuales del orador (`d_role`: PM, DPM, LO, DLO, etc.) y la posición en el equipo (`t_role`: primer u segundo orador).
+2. **Motor Dual de Extracción de Roles (`extractor.py`)**
+   * **Motor Principal (Papeletas Públicas):** Decodifica las variables de estado JavaScript (`window.vueData`) y papeletas detalladas para capturar el rol exacto de cada orador (`d_role`: PM, DPM, LO, DLO, MG, GW, MO, OW).
+   * **Motor de Respaldo (*Fallback* de Team Record):** Si un torneo no publica sus papeletas (ej. PUCP Open, Rosario Open), el extractor analiza automáticamente los tooltips y cámaras de la vista *Team Record* para reconstruir de forma determinista los puntajes y roles en estricto orden de intervención.
 
-3. **Mecanismo Failsafe de 2 Pasos e Ingesta Idempotente (`loader.py`)**
-   * **Paso 1 (Comprobación de URL):** Verifica en `master_torneos_registro` si el dominio del torneo ya fue procesado por completo para evitar ejecuciones redundantes.
-   * **Paso 2 (Actualización Parcial / Future-Proofing):** Evalúa si el torneo existente cuenta con columnas vacías (`NULL`) como `d_role` o `t_role` y ejecuta una actualización dirigida sin duplicar registros.
-   * **Ingesta Limpia:** Aplica borrados preventivos (`DELETE FROM ... WHERE tournament = :slug`) sobre las tablas maestras antes de reinsertar datos completos, garantizando una base de datos 100% limpia.
+3. **Procesamiento Desacoplado en Memoria e Ingesta Segura (`loader.py`)**
+   * **Failsafe por URL:** Verifica en `master_torneos_registro` si el dominio del torneo ya fue procesado antes de iniciar el scraping para evitar duplicados.
+   * **Scraping sin Conexiones Inactivas:** Ejecuta todas las peticiones web, transformaciones en Pandas y cruces de roles en memoria local, abriendo la conexión a Neon PostgreSQL únicamente al final para realizar inserciones rápidas por lotes (`chunksize=500`).
+   * **Mapeo Numérico de Jueces:** Extrae la nómina de jueces clasificados transformando indicadores visuales en valores numéricos (`1.0` / `0.0`) para las columnas `adjcore` e `independent`.
 
 4. **Interfaz de Escritorio (`ui.py`)**
    * Ingesta manual por lote o mediante archivos CSV/Excel, consola de eventos multihilo integrada y ejecución sin congelamiento de interfaz.
@@ -157,11 +155,11 @@ tabbycat-neon-scraper/
 
 ### Estructura de la Base de Datos (Neon PostgreSQL)
 
-* **`master_torneos_registro`**: Tabla de control para registro de torneos procesados.
-* **`master_motions`**: Mociones e infoslides extraídos (`ON CONFLICT (motion) DO NOTHING`).
-* **`master_speakers_ajustado`**: Tab de oradores con puntajes, llaves de ronda, `d_role` y `t_role`.
-* **`master_consolidado_resultados`**: Resultados por ronda, bancadas y llaves únicas.
-* **`master_breaking_adjudicators`**: Nómina y puntajes de jueces clasificados.
+* **`master_torneos_registro`**: Tabla de control para registro de torneos procesados, slugs, fechas y estados.
+* **`master_motions`**: Mociones e infoslides extraídos por ronda.
+* **`master_speakers_ajustado`**: Tab de oradores estructurado por ronda con puntajes individuales, `d_role` y metadatos del torneo.
+* **`master_consolidado_resultados`**: Resultados por ronda, cámaras (`Side`) y registro de equipos.
+* **`master_breaking_adjudicators`**: Nómina de jueces clasificados, instituciones e indicadores numéricos (`adjcore`, `independent`).
 
 ---
 
